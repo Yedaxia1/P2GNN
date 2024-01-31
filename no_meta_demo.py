@@ -1,0 +1,307 @@
+import os 
+os.environ['CUDA_VISIBLE_DEVICES'] = "0,1"
+
+from ProG.utils import load_data4pretrain_bigscale, seed_everything, seed
+
+seed_everything(seed)
+
+from ProG import PreTrain
+from ProG.utils import mkdir, load_data4pretrain
+from ProG.prompt import GNN, LightPrompt, HeavyPrompt, Prompted_GNN
+from torch import nn, optim
+import torch.optim.lr_scheduler as lr_scheduler
+from ProG.data import multi_class_NIG
+import torch
+from torch_geometric.loader import DataLoader
+from ProG.eva import acc_f1_over_batches
+import json
+
+# this file can not move in ProG.utils.py because it will cause self-loop import
+def model_create_ori(dataname, gnn_type, num_class, task_type='multi_class_classification', tune_answer=False):
+    if task_type in ['multi_class_classification', 'regression']:
+        input_dim, hid_dim = 100, 100
+        lr, wd = 0.001, 0.00001
+        tnpc = 100  # token number per class
+
+        # load pre-trained GNN
+        gnn = GNN(input_dim, hid_dim=hid_dim, out_dim=hid_dim, gcn_layer_num=2, gnn_type=gnn_type)
+        pre_train_path = './pre_trained_gnn/{}.GraphCL.{}.pth'.format(dataname, gnn_type)
+        gnn.load_state_dict(torch.load(pre_train_path))
+        print("successfully load pre-trained weights for gnn! @ {}".format(pre_train_path))
+        for p in gnn.parameters():
+            p.requires_grad = False
+
+        if tune_answer:
+            PG = HeavyPrompt(token_dim=input_dim, token_num=10, cross_prune=0.1, inner_prune=0.3)
+        else:
+            PG = LightPrompt(token_dim=input_dim, token_num_per_group=tnpc, group_num=num_class, inner_prune=0.01)
+
+        opi = optim.Adam(filter(lambda p: p.requires_grad, PG.parameters()),
+                         lr=lr,
+                         weight_decay=wd)
+
+        if task_type == 'regression':
+            lossfn = nn.MSELoss(reduction='mean')
+        else:
+            lossfn = nn.CrossEntropyLoss(reduction='mean')
+
+        if tune_answer:
+            if task_type == 'regression':
+                answering = torch.nn.Sequential(
+                    torch.nn.Linear(hid_dim, num_class),
+                    torch.nn.Sigmoid())
+            else:
+                answering = torch.nn.Sequential(
+                    torch.nn.Linear(hid_dim, num_class),
+                    torch.nn.Softmax(dim=1))
+
+            opi_answer = optim.Adam(filter(lambda p: p.requires_grad, answering.parameters()), lr=0.01,
+                                    weight_decay=0.00001)
+        else:
+            answering, opi_answer = None, None
+        gnn.cuda()
+        PG.cuda()
+        return gnn, PG, opi, lossfn, answering, opi_answer
+    else:
+        raise ValueError("model_create function hasn't supported {} task".format(task_type))
+
+def model_create(args, tune_answer=False):
+    if args["task_type"] in ['multi_class_classification', 'regression']:
+        input_dim, hid_dim = 256, 256
+        lr, wd = 0.001, 0.0001
+        tnpc = 100  # token number per class
+
+        # load pre-trained GNN
+        # gnn = GNN(input_dim, hid_dim=hid_dim, out_dim=hid_dim, gcn_layer_num=2, gnn_type=gnn_type)
+        gnn = Prompted_GNN(args["input_dim"], hid_dim=args["hid_dim"], out_dim=args["out_dim"], 
+                           gcn_layer_num=args["gcn_layer_num"], gnn_type=args["gnn_type"], 
+                           token_num=args["prompt_token_num"], cross_prune=args["cross_prune"], inner_prune=args["inner_prune"])
+        
+        pre_train_path = './pre_trained_gnn/{}.GraphCL.{}.pth'.format(args["dataname"], args["gnn_type"])
+        gnn.load_state_dict(torch.load(pre_train_path))
+        print("successfully load pre-trained weights for gnn! @ {}".format(pre_train_path))
+
+        if args["task_type"] == 'regression':
+            lossfn = nn.MSELoss(reduction='mean')
+        else:
+            lossfn = nn.CrossEntropyLoss(reduction='mean')
+
+        if tune_answer:
+            if args["task_type"] == 'regression':
+                answering = torch.nn.Sequential(
+                    torch.nn.Linear(args["out_dim"], args["num_class"]),
+                    torch.nn.Sigmoid())
+            else:
+                answering = torch.nn.Sequential(
+                    torch.nn.Linear(args["out_dim"], args["num_class"]),
+                    torch.nn.Softmax(dim=1))
+
+            # opi_answer = optim.Adam(filter(lambda p: p.requires_grad, answering.parameters()), lr=0.01,
+            #                         weight_decay=0.00001)
+        else:
+            answering, opi_answer = None, None
+        
+        if args["is_cuda"]:
+            gnn = gnn.cuda()
+            answering = answering.cuda()
+            lossfn = lossfn.cuda()
+        gnn.frozen_gnn()
+
+        #set up optimizer
+        #different learning rate for different part of GNN
+        model_param_group = []
+        model_param_group.append({"params": filter(lambda p: p.requires_grad, gnn.parameters())})
+
+        model_param_group.append({"params": filter(lambda p: p.requires_grad, answering.parameters())})
+        
+        optimizer = optim.Adam(model_param_group, lr=args["tuning_lr"], weight_decay=args["tuning_decay"])
+        scheduler = lr_scheduler.StepLR(optimizer, step_size=50, gamma=0.1)
+        # print(optimizer)
+
+        return gnn, optimizer, scheduler, lossfn, answering
+    else:
+        raise ValueError("model_create function hasn't supported {} task".format(args["task_type"]))
+
+
+
+def pretrain(args):
+    mkdir('./pre_trained_gnn/')
+
+    # pretext = args['pretext']  # 'GraphCL', 'SimGRACE' 
+    # gnn_type = args['gnn_type']  # 'GAT', ''TransformerConv
+    dataname, num_parts = args['dataname'], args['pretrain_num_parts']
+
+    print("load data...")
+    if dataname in ['Reddit', 'ogbn_arxiv', 'ogbn_products']:
+        graph_list, input_dim = load_data4pretrain_bigscale(dataname, num_class=args['num_class'])
+    else:
+        graph_list, input_dim = load_data4pretrain(dataname, num_parts)
+    
+    print("create PreTrain instance...")
+    pt = PreTrain(args)
+    
+    pt.model.cuda()
+    print("pre-training...")
+    pt.train(dataname, graph_list, batch_size=args['batch_size'],
+             aug1=args['aug1'], aug2=args['aug2'], aug_ratio=args['aug_ratio'],
+             lr=args['pretrain_lr'], decay=args['pretrain_decay'], epochs=args['pretrain_epoch'], 
+             step_size=args['pretrain_step_size'], gamma=args['pretrain_gamma'])
+
+
+def prompt_w_o_h(dataname="CiteSeer", gnn_type="TransformerConv", num_class=6, task_type='multi_class_classification'):
+    _, _, train_list, test_list = multi_class_NIG(dataname, num_class, shots=100)
+
+    train_loader = DataLoader(train_list, batch_size=100, shuffle=True)
+    test_loader = DataLoader(test_list, batch_size=100, shuffle=True)
+
+    gnn, PG, opi_pg, lossfn, answering, opi_answer = model_create(dataname, gnn_type, num_class, task_type, False)
+    # Here we have: answering, opi_answer=None, None
+    lossfn.cuda()
+    
+
+    prompt_epoch = 200
+    # training stage
+    PG.train()
+    for j in range(1, prompt_epoch + 1):
+        running_loss = 0.
+        for batch_id, train_batch in enumerate(train_loader):
+            # print(train_batch)
+            train_batch = train_batch.cuda()
+            emb0 = gnn(train_batch.x, train_batch.edge_index, train_batch.batch)
+            pg_batch = PG.inner_structure_update()
+            pg_emb = gnn(pg_batch.x, pg_batch.edge_index, pg_batch.batch)
+            # cross link between prompt and input graphs
+            dot = torch.mm(emb0, torch.transpose(pg_emb, 0, 1))
+            if task_type == 'multi_class_classification':
+                sim = torch.softmax(dot, dim=1)
+            elif task_type == 'regression':
+                sim = torch.sigmoid(dot)  # 0-1
+            else:
+                raise KeyError("task type error!")
+
+            train_loss = lossfn(sim, train_batch.y)
+            opi_pg.zero_grad()
+            train_loss.backward()
+            opi_pg.step()
+            running_loss += train_loss.item()
+
+            if batch_id % 5 == 4:  # report every 5 updates
+                last_loss = running_loss / 5  # loss per batch
+                print(
+                    'epoch {}/{} | batch {}/{} | loss: {:.8f}'.format(j, prompt_epoch, batch_id+1, len(train_loader),
+                                                                      last_loss))
+
+                running_loss = 0.
+
+        if j % 5 == 0:
+            PG.eval()
+            PG = PG.to("cpu")
+            gnn = gnn.to("cpu")
+            acc_f1_over_batches(test_loader, PG, gnn, answering, num_class, task_type)
+
+            PG.train()
+            PG = PG.cuda()
+            gnn = gnn.cuda()
+
+
+def train_one_outer_epoch(epoch, train_loader, opi, scheduler, lossfn, gnn, answering):
+    for j in range(1, epoch + 1):
+        running_loss = 0.
+        total_step = 0
+        # bar2=tqdm(enumerate(train_loader))
+        for batch_id, train_batch in enumerate(train_loader):  # bar2
+            # print(train_batch)
+            train_batch = train_batch.cuda()
+            # print(prompted_graph)
+
+            graph_emb = gnn(train_batch)
+            # print(graph_emb)
+            pre = answering(graph_emb)
+            # print(pre)
+            train_loss = lossfn(pre, train_batch.y)
+            # print('\t\t==> answer_epoch {}/{} | batch {} | loss: {:.8f}'.format(j, answer_epoch, batch_id,
+            #                                                                     train_loss.item()))
+
+            opi.zero_grad()
+            train_loss.backward()
+            opi.step()
+            running_loss += train_loss.item() 
+            total_step = total_step + 1
+        
+            # if batch_id % 5 == 4:  # report every 5 updates
+            #     last_loss = running_loss / 5  # loss per batch
+            #     # bar2.set_description('answer_epoch {}/{} | batch {} | loss: {:.8f}'.format(j, answer_epoch, batch_id,
+            #     #                                                                     last_loss))
+            #     print(
+            #         'epoch {}/{} | batch {}/{} | loss: {:.8f}'.format(j, epoch, batch_id, len(train_loader), last_loss))
+
+            #     running_loss = 0.
+        
+        print("**tuning epoch: {}/{} | train_loss: {:.8}".format(j, epoch, running_loss/total_step))
+        
+        scheduler.step()
+
+
+def prompt_w_h(args):
+    _, _, train_list, test_list = multi_class_NIG(args["dataname"], args["num_class"], shots=args["tuning_shot"])
+
+    train_loader = DataLoader(train_list, batch_size=args["batch_size"], shuffle=True)
+    test_loader = DataLoader(test_list, batch_size=args["batch_size"], shuffle=True)
+
+    gnn, optimizer, scheduler, lossfn, answering = model_create(args, tune_answer=True)
+
+    # inspired by: Hou Y et al. MetaPrompting: Learning to Learn Better Prompts. COLING 2022
+    # if we tune the answering function, we update answering and prompt alternately.
+    # ignore the outer_epoch if you do not wish to tune any use any answering function
+    # (such as a hand-crafted answering template as prompt_w_o_h)
+    outer_epoch = 10
+    answer_epoch = 1  # 50
+    prompt_epoch = 1  # 50
+    tuning_epoch = args["tuning_epoch"]
+
+    # training stage
+    answering.train()
+    train_one_outer_epoch(tuning_epoch, train_loader, optimizer, scheduler, lossfn, gnn, answering)
+    
+    # for i in range(1, outer_epoch + 1):
+    #     print(("{}/{} frozen gnn | tuning prompt | *tune answering function...".format(i, outer_epoch)))
+    #     # tune task head
+    #     answering.train()
+    #     train_one_outer_epoch(tuning_epoch, train_loader, optimizer, lossfn, gnn, answering)
+
+        # print("{}/{}  frozen gnn | *tune prompt |frozen answering function...".format(i, outer_epoch))
+        # # tune prompt
+        # answering.eval()
+        # train_one_outer_epoch(prompt_epoch, train_loader, opi_pg, lossfn, gnn, PG, answering)
+
+    # testing stage
+    gnn.eval()
+    answering.eval()
+    acc_f1_over_batches(args, test_loader, gnn, answering, args["num_class"], args["task_type"])     
+
+
+
+if __name__ == '__main__':
+    
+    dataset = 'Computers'  # 'CiteSeer'  # 'PubMed' 'Cora'  Computers  'Reddit' 'ogbn_arxiv'  'ogbn_products'  'dblp'
+    pretext = 'GraphCL'     # 'SimGRACE'    # 'GraphCL'
+    gnn_type = 'GCN'    # 'GCN'  # 'GAT'  # 'TransformerConv'
+    with open("./config/{}/{}.{}.{}.json".format(dataset, dataset, pretext, gnn_type)) as params:
+        args = json.load(params)
+        
+    # print("PyTorch version:", torch.__version__)
+
+    # if torch.cuda.is_available():
+    #     print("CUDA is available")
+    #     print("CUDA version:", torch.version.cuda)
+    #     device = torch.device("cuda:2")
+    # else:
+    #     print("CUDA is not available")
+    #     device = torch.device("cpu")
+
+    # print(device)
+    # # device = torch.device('cpu')
+
+    pretrain(args)
+    # prompt_w_o_h(dataname="CiteSeer", gnn_type="TransformerConv", num_class=6, task_type='multi_class_classification')
+    # prompt_w_h(args)
