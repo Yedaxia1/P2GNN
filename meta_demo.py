@@ -353,7 +353,7 @@ if __name__ == '__main__':
                         dataname, args['batch_size'], adapt_steps=args['meta_train_adapt_steps'], K_shot=100, args=args)
 
         # meta testing on target tasks
-        adapt_steps_meta_test = 50  # 00  # 50
+        adapt_steps_meta_test = args['meta_test_adapt_steps']  # 00  # 50
         acc, f1, auc = meta_test_adam(meta_test_task_id_list, dataname, args['batch_size'], 100, seed, maml, gnn,
                                         adapt_steps_meta_test, lossfn, args=args)
         
